@@ -1,0 +1,14 @@
+{
+  "name":         "ender-swig",
+  "version":      "0.8.0",
+  "description":  "Ender port of Swig (fast django-like templating engine for node.js and browsers)",
+  "keywords":     ["template", "templating", "html", "django", "express", "block", "ender"],
+  "main":         "index.js",
+  "ender":        "ender.js",
+  "dependencies": {
+    "underscore": ">=1.1.7"
+  },
+  "scripts": {
+    "build": "./scripts/build.sh"
+  }
+}
