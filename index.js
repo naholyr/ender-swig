@@ -1,7 +1,8 @@
 /*!
   * Swig https://paularmstrong.github.com/swig | https://github.com/paularmstrong/swig/blob/master/LICENSE 
   * Cross-Browser Split 1.0.1 (c) Steven Levithan <stevenlevithan.com>; MIT License An ECMA-compliant, uniform cross-browser split method 
-  * Underscore.js 1.1.7 (c) 2011 Jeremy Ashkenas, DocumentCloud Inc. Underscore is freely distributable under the MIT license. Portions of Underscore are inspired or borrowed from Prototype, Oliver Steele's Functional, and John Resig's Micro-Templating. For all details and documentation: http://documentcloud.github.com/underscore 
+  * Underscore.js (c) 2011 Jeremy Ashkenas | https://github.com/documentcloud/underscore/blob/master/LICENSE 
+  * DateZ (c) 2011 Tomo Universalis | https://github.com/TomoUniversalis/DateZ/blob/master/LISENCE (function () {
   */
 
 !function (_) {
@@ -120,7 +121,8 @@ tags = {};
         encoding: 'utf8',
         filters: filters,
         root: '/',
-        tags: tags
+        tags: tags,
+        tzOffset: 0
     },
     _config = _.extend({}, config),
     CACHE = {};
@@ -131,6 +133,8 @@ exports.init = function (options) {
     _config = _.extend({}, config, options);
     _config.filters = _.extend(filters, options.filters);
     _config.tags = _.extend(tags, options.tags);
+
+    dateformat.defaultTZOffset = _config.tzOffset;
 };
 
 function TemplateError(error) {
@@ -258,7 +262,7 @@ exports.compile = function (source, options) {
 };
 })(swig);
 (function (exports) {
-var _months = {
+    _months = {
         full: ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'],
         abbr: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
     },
@@ -267,6 +271,95 @@ var _months = {
         abbr: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
         alt: {'-1': 'Yesterday', 0: 'Today', 1: 'Tomorrow'}
     };
+
+/*
+DateZ is licensed under the MIT License:
+Copyright (c) 2011 Tomo Universalis (http://tomouniversalis.com)
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions: 
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+exports.defaultTZOffset = 0;
+exports.DateZ = function () {
+    var members = {
+            'default': ['getUTCDate', 'getUTCDay', 'getUTCFullYear', 'getUTCHours', 'getUTCMilliseconds', 'getUTCMinutes', 'getUTCMonth', 'getUTCSeconds', 'toISOString', 'toGMTString', 'toUTCString', 'valueOf', 'getTime'],
+            z: ['getDate', 'getDay', 'getFullYear', 'getHours', 'getMilliseconds', 'getMinutes', 'getMonth', 'getSeconds', 'getYear', 'toDateString', 'toLocaleDateString', 'toLocaleTimeString'],
+            'string': ['toLocaleString', 'toString', 'toTimeString'],
+            zSet: ['setDate', 'setFullYear', 'setHours', 'setMilliseconds', 'setMinutes', 'setMonth', 'setSeconds', 'setTime', 'setYear'],
+            set: ['setUTCDate', 'setUTCFullYear', 'setUTCHours', 'setUTCMilliseconds', 'setUTCMinutes', 'setUTCMonth', 'setUTCSeconds'],
+            'static': ['UTC', 'parse']
+        },
+        d = this,
+        i;
+
+    d.date = d.dateZ = (arguments.length > 1) ? new Date(Date.UTC.apply(Date, arguments) + ((new Date()).getTimezoneOffset() * 60000)) : (arguments.length === 1) ? new Date(new Date(arguments['0'])) : new Date();
+
+    d.timezoneOffset = d.dateZ.getTimezoneOffset();
+
+    function zeroPad(i) {
+        return (i < 10) ? '0' + i : i;
+    }
+    function _toTZString() {
+        var hours = zeroPad(Math.floor(Math.abs(d.timezoneOffset) / 60)),
+            minutes = zeroPad(Math.abs(d.timezoneOffset) - hours * 60),
+            prefix = (d.timezoneOffset < 0) ? '+' : '-',
+            abbr = (d.tzAbbreviation === undefined) ? '' : ' (' + d.tzAbbreviation + ')';
+
+        return 'GMT' + prefix + hours + minutes + abbr;
+    }
+
+    _.each(members.z, function (name) {
+        d[name] = function () {
+            return d.dateZ[name]();
+        };
+    });
+    _.each(members.string, function (name) {
+        d[name] = function () {
+            return d.dateZ[name].apply(d.dateZ, []).replace(/GMT[+\-]\\d{4} \\(([a-zA-Z]{3,4})\\)/, _toTZString());
+        };
+    });
+    _.each(members['default'], function (name) {
+        d[name] = function () {
+            return d.date[name]();
+        };
+    });
+    _.each(members['static'], function (name) {
+        d[name] = function () {
+            return Date[name].apply(Date, arguments);
+        };
+    });
+    _.each(members.zSet, function (name) {
+        d[name] = function () {
+            d.dateZ[name].apply(d.dateZ, arguments);
+            d.date = new Date(d.dateZ.getTime() - d.dateZ.getTimezoneOffset() * 60000 + d.timezoneOffset * 60000);
+            return d;
+        };
+    });
+    _.each(members.set, function (name) {
+        d[name] = function () {
+            d.date[name].apply(d.date, arguments);
+            d.dateZ = new Date(d.date.getTime() + d.date.getTimezoneOffset() * 60000 - d.timezoneOffset * 60000);
+            return d;
+        };
+    });
+
+    if (exports.defaultTZOffset) {
+        this.setTimezoneOffset(exports.defaultTZOffset);
+    }
+};
+exports.DateZ.prototype = {
+    getTimezoneOffset: function () {
+        return this.timezoneOffset;
+    },
+    setTimezoneOffset: function (offset, abbr) {
+        this.timezoneOffset = offset;
+        if (abbr) {
+            this.tzAbbreviation = abbr;
+        }
+        this.dateZ = new Date(this.date.getTime() + this.date.getTimezoneOffset() * 60000 - this.timezoneOffset * 60000);
+        return this;
+    }
+};
 
 // Day
 exports.d = function (input) {
@@ -285,14 +378,20 @@ exports.N = function (input) {
     return input.getDay();
 };
 exports.S = function (input) {
-    return (input.getDate() % 10 === 1 && input.getDate() !== 11 ? 'st' : (input.getDate() % 10 === 2 && input.getDate() !== 12 ? 'nd' : (input.getDate() % 10 === 3 && input.getDate() !== 13 ? 'rd' : 'th')));
+    var d = input.getDate();
+    return (d % 10 === 1 && d !== 11 ? 'st' : (d % 10 === 2 && d !== 12 ? 'nd' : (d % 10 === 3 && d !== 13 ? 'rd' : 'th')));
 };
 exports.w = function (input) {
     return input.getDay() - 1;
 };
-exports.z = function (input) {
-    var year = input.getFullYear();
-    return Math.round(((new Date(year, input.getMonth(), input.getDate(), 12, 0, 0)) - (new Date(year, 0, 1, 12, 0, 0))) / 86400000);
+exports.z = function (input, offset, abbr) {
+    var year = input.getFullYear(),
+        e = new exports.DateZ(year, input.getMonth(), input.getDate(), 12, 0, 0),
+        d = new exports.DateZ(year, 0, 1, 12, 0, 0);
+
+    e.setTimezoneOffset(offset, abbr);
+    d.setTimezoneOffset(offset, abbr);
+    return Math.round((e - d) / 86400000);
 };
 
 // Week
@@ -358,22 +457,27 @@ exports.B = function (input) {
     return ('000'.concat(beats).slice(beats.length));
 };
 exports.g = function (input) {
-    return input.getHours() === 0 ? 12 : (input.getHours() > 12 ? input.getHours() - 12 : input.getHours());
+    var h = input.getHours();
+    return h === 0 ? 12 : (h > 12 ? h - 12 : h);
 };
 exports.G = function (input) {
     return input.getHours();
 };
 exports.h = function (input) {
-    return (input.getHours() < 10 || (12 < input.getHours() < 22) ? '0' : '') + (input.getHours() < 10 ? input.getHours() : input.getHours() - 12);
+    var h = input.getHours();
+    return ((h < 10 || (12 < h && 22 > h)) ? '0' : '') + ((h < 12) ? h : h - 12);
 };
 exports.H = function (input) {
-    return (input.getHours() < 10 ? '0' : '') + input.getHours();
+    var h = input.getHours();
+    return (h < 10 ? '0' : '') + h;
 };
 exports.i = function (input) {
-    return (input.getMinutes() < 10 ? '0' : '') + input.getMinutes();
+    var m = input.getMinutes();
+    return (m < 10 ? '0' : '') + m;
 };
 exports.s = function (input) {
-    return (input.getSeconds() < 10 ? '0' : '') + input.getSeconds();
+    var s = input.getSeconds();
+    return (s < 10 ? '0' : '') + s;
 };
 //u = function () { return ''; },
 
@@ -381,7 +485,8 @@ exports.s = function (input) {
 //e = function () { return ''; },
 //I = function () { return ''; },
 exports.O = function (input) {
-    return (input.getTimezoneOffset() < 0 ? '-' : '+') + (input.getTimezoneOffset() / 60 < 10 ? '0' : '') + (input.getTimezoneOffset() / 60) + '00';
+    var tz = input.getTimezoneOffset();
+    return (tz < 0 ? '-' : '+') + (tz / 60 < 10 ? '0' : '') + (tz / 60) + '00';
 };
 //T = function () { return ''; },
 exports.Z = function (input) {
@@ -393,7 +498,7 @@ exports.c = function (input) {
     return input.toISOString();
 };
 exports.r = function (input) {
-    return input.toString();
+    return input.toUTCString();
 };
 exports.U = function (input) {
     return input.getTime() / 1000;
@@ -410,11 +515,8 @@ exports.add = function (input, addend) {
         return _.extend(input, addend);
     }
 
-    var inputNum = parseInt(input, 10),
-        addendNum = parseInt(addend, 10);
-
-    if (_.isNumber(inputNum) && _.isNumber(addendNum)) {
-        return inputNum + addendNum;
+    if (_.isNumber(input) && _.isNumber(addend)) {
+        return input + addend;
     }
 
     return input + addend;
@@ -440,17 +542,21 @@ exports.capitalize = function (input) {
     return input.toString().charAt(0).toUpperCase() + input.toString().substr(1).toLowerCase();
 };
 
-exports.date = function (input, format) {
+exports.date = function (input, format, offset, abbr) {
     var l = format.length,
-        date = new Date(input),
+        date = new dateformat.DateZ(input),
         cur,
         i = 0,
         out = '';
 
+    if (offset) {
+        date.setTimezoneOffset(offset, abbr);
+    }
+
     for (i; i < l; i += 1) {
         cur = format.charAt(i);
         if (dateformat.hasOwnProperty(cur)) {
-            out += dateformat[cur](date);
+            out += dateformat[cur](date, offset, abbr);
         } else {
             out += cur;
         }
@@ -1015,7 +1121,10 @@ exports.parse = function (data, tags, autoescape) {
         lines = 1,
         curline = 1,
         newlines = null,
-        lastToken;
+        lastToken,
+        rawStart = /^\{\% *raw *\%\}/,
+        rawEnd = /\{\% *endraw *\%\}$/,
+        inRaw = false;
 
     for (i; i < j; i += 1) {
         token = rawtokens[i];
@@ -1023,6 +1132,11 @@ exports.parse = function (data, tags, autoescape) {
         newlines = token.match(/\n/g);
         if (newlines) {
             lines += newlines.length;
+        }
+
+        if (inRaw !== false && !rawEnd.test(token)) {
+            inRaw += token;
+            continue;
         }
 
         // Ignore empty strings and comments
@@ -1033,6 +1147,20 @@ exports.parse = function (data, tags, autoescape) {
         } else if (variableRegexp.test(token)) {
             token = exports.parseVariable(token, escape);
         } else if (logicRegexp.test(token)) {
+            if (rawEnd.test(token)) {
+                // Don't care about the content in a raw tag, so end tag may not start correctly
+                token = inRaw + token.replace(rawEnd, '');
+                inRaw = false;
+                stack[index].push(token);
+                continue;
+            }
+
+            if (rawStart.test(token)) {
+                // Have to check the whole token directly, not just parts, as the tag may not end correctly while in raw
+                inRaw = token.replace(rawStart, '');
+                continue;
+            }
+
             parts = token.replace(/^\{% *| *%\}$/g, '').split(' ');
             tagname = parts.shift();
 
@@ -1078,6 +1206,10 @@ exports.parse = function (data, tags, autoescape) {
 
         // Everything else is treated as a string
         stack[index].push(token);
+    }
+
+    if (inRaw !== false) {
+        throw new Error('Missing expected end tag for "raw" on line ' + curline + '.');
     }
 
     if (index !== 0) {
@@ -1184,7 +1316,8 @@ exports.compile = function compile(indent, parentBlock) {
     }, this);
 
     return code;
-};})(parser);
+};
+})(parser);
 (function (exports) {
 
 /**
@@ -1195,6 +1328,7 @@ exports.compile = function compile(indent, parentBlock) {
 exports['extends'] = {};
 exports.block = { ends: true };
 exports.parent = {};
+exports.raw = { ends: true };
 
 /**
 * Includes another template. The included template will have access to the
@@ -1532,7 +1666,6 @@ exports.filter = function (indent) {
     return '__output += ' + helpers.wrapFilter(value.replace(/\n/g, ''), { name: name, args: args }) + ';\n';
 };
 exports.filter.ends = true;
-
 })(tags);
 return swig;
 })();
