@@ -1,6 +1,6 @@
 {
   "name":         "ender-swig",
-  "version":      "0.9.0",
+  "version":      "0.11.2",
   "description":  "Ender port of Swig (fast django-like templating engine for node.js and browsers)",
   "keywords":     ["template", "templating", "html", "django", "express", "block", "ender"],
   "repository": {

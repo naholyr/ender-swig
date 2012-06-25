@@ -122,6 +122,7 @@ tags = {};
         filters: filters,
         root: '/',
         tags: tags,
+        extensions: {},
         tzOffset: 0
     },
     _config = _.extend({}, config),
@@ -173,33 +174,33 @@ function createTemplate(data, id) {
     code = parser.compile.call(template);
 
     // The compiled render function - this is all we need
-    render = new Function('__context', '__parents', '__filters', '_', [
-        '__parents = __parents ? __parents.slice() : [];',
+    render = new Function('_context', '_parents', '_filters', '_', '_ext', [
+        '_parents = _parents ? _parents.slice() : [];',
+        '_context = _context || {};',
         // Prevents circular includes (which will crash node without warning)
-        'var j = __parents.length,',
-        '    __output = "",',
-        '    __this = this;',
+        'var j = _parents.length,',
+        '    _output = "",',
+        '    _this = this;',
         // Note: this loop averages much faster than indexOf across all cases
         'while (j--) {',
-        '   if (__parents[j] === this.id) {',
-        '         return "Circular import of template " + this.id + " in " + __parents[__parents.length-1];',
+        '   if (_parents[j] === this.id) {',
+        '         return "Circular import of template " + this.id + " in " + _parents[_parents.length-1];',
         '   }',
         '}',
         // Add this template as a parent to all includes in its scope
-        '__parents.push(this.id);',
+        '_parents.push(this.id);',
         code,
-        'return __output;',
+        'return _output;',
     ].join(''));
 
     template.render = function (context, parents) {
         if (_config.allowErrors) {
-            return render.call(this, context, parents, _config.filters, _);
-        } else {
-            try {
-                return render.call(this, context, parents, _config.filters, _);
-            } catch (e) {
-                return new TemplateError(e);
-            }
+            return render.call(this, context, parents, _config.filters, _, _config.extensions);
+        }
+        try {
+            return render.call(this, context, parents, _config.filters, _, _config.extensions);
+        } catch (e) {
+            return new TemplateError(e);
         }
     };
 
@@ -235,7 +236,7 @@ exports.compileFile = function (filepath) {
     }
 
     get = function () {
-        var file = ((/^\//).test(filepath)) ? filepath : _config.root + '/' + filepath,
+        var file = ((/^\//).test(filepath) || (/^.:/).test(filepath)) ? filepath : _config.root + '/' + filepath,
             data = fs.readFileSync(file, config.encoding);
         tpl = getTemplate(data, { filename: filepath });
     };
@@ -262,6 +263,419 @@ exports.compile = function (source, options) {
 };
 })(swig);
 (function (exports) {
+    // Javascript keywords can't be a name: 'for.is_invalid' as well as 'for' but not 'for_' or '_for'
+    KEYWORDS = /^(Array|ArrayBuffer|Boolean|Date|Error|eval|EvalError|Function|Infinity|Iterator|JSON|Math|Namespace|NaN|Number|Object|QName|RangeError|ReferenceError|RegExp|StopIteration|String|SyntaxError|TypeError|undefined|uneval|URIError|XML|XMLList|break|case|catch|continue|debugger|default|delete|do|else|finally|for|function|if|in|instanceof|new|return|switch|this|throw|try|typeof|var|void|while|with)(?=(\.|$))/;
+
+// Returns TRUE if the passed string is a valid javascript string literal
+exports.isStringLiteral = function (string) {
+    if (typeof string !== 'string') {
+        return false;
+    }
+
+    var first = string.substring(0, 1),
+        last = string.charAt(string.length - 1, 1),
+        teststr;
+
+    if ((first === last) && (first === "'" || first === '"')) {
+        teststr = string.substr(1, string.length - 2).split('').reverse().join('');
+
+        if ((first === "'" && (/'(?!\\)/).test(teststr)) || (last === '"' && (/"(?!\\)/).test(teststr))) {
+            throw new Error('Invalid string literal. Unescaped quote (' + string[0] + ') found.');
+        }
+
+        return true;
+    }
+
+    return false;
+};
+
+// Returns TRUE if the passed string is a valid javascript number or string literal
+exports.isLiteral = function (string) {
+    var literal = false;
+
+    // Check if it's a number literal
+    if ((/^\d+([.]\d+)?$/).test(string)) {
+        literal = true;
+    } else if (exports.isStringLiteral(string)) {
+        literal = true;
+    }
+
+    return literal;
+};
+
+// Variable names starting with __ are reserved.
+exports.isValidName = function (string) {
+    return ((typeof string === 'string')
+        && string.substr(0, 2) !== '__'
+        && (/^([$A-Za-z_]+[$A-Za-z_0-9]*)(\.?([$A-Za-z_]+[$A-Za-z_0-9]*))*$/).test(string)
+        && !KEYWORDS.test(string));
+};
+
+// Variable names starting with __ are reserved.
+exports.isValidShortName = function (string) {
+    return string.substr(0, 2) !== '__' && (/^[$A-Za-z_]+[$A-Za-z_0-9]*$/).test(string) && !KEYWORDS.test(string);
+};
+
+// Checks if a name is a vlaid block name
+exports.isValidBlockName = function (string) {
+    return (/^[A-Za-z]+[A-Za-z_0-9]*$/).test(string);
+};
+
+/**
+* Returns a valid javascript code that will
+* check if a variable (or property chain) exists
+* in the evaled context. For example:
+*    check('foo.bar.baz')
+* will return the following string:
+*    typeof foo !== 'undefined' && typeof foo.bar !== 'undefined' && typeof foo.bar.baz !== 'undefined'
+*/
+function check(variable, context) {
+    if (_.isArray(variable)) {
+        return '(true)';
+    }
+
+    variable = variable.replace(/^this/, '_this.__currentContext');
+
+    if (exports.isLiteral(variable)) {
+        return '(true)';
+    }
+
+    var props = variable.split(/(\.|\[|\])/),
+        chain = '',
+        output = [],
+        inArr = false,
+        prevDot = false;
+
+    if (typeof context === 'string' && context.length) {
+        props.unshift(context);
+    }
+
+    props = _.reject(props, function (val) {
+        return val === '';
+    });
+
+    _.each(props, function (prop) {
+        if (prop === '.') {
+            prevDot = true;
+            return;
+        }
+
+        if (prop === '[') {
+            inArr = true;
+            return;
+        }
+
+        if (prop === ']') {
+            inArr = false;
+            return;
+        }
+
+        if (!chain) {
+            chain = prop;
+        } else if (inArr) {
+            if (!exports.isStringLiteral(prop)) {
+                if (prevDot) {
+                    output[output.length - 1] = _.last(output).replace(/\] !== "undefined"$/, '_' + prop + '] !== "undefined"');
+                    chain = chain.replace(/\]$/, '_' + prop + ']');
+                    return;
+                }
+                chain += '[___' + prop + ']';
+            } else {
+                chain += '[' + prop + ']';
+            }
+        } else {
+            chain += '.' + prop;
+        }
+        prevDot = false;
+        output.push('typeof ' + chain + ' !== "undefined"');
+    });
+
+    return '(' + output.join(' && ') + ')';
+}
+exports.check = check;
+
+/**
+* Returns an escaped string (safe for evaling). If context is passed
+* then returns a concatenation of context and the escaped variable name.
+*/
+exports.escapeVarName = function (variable, context) {
+    if (_.isArray(variable)) {
+        _.each(variable, function (val, key) {
+            variable[key] = exports.escapeVarName(val, context);
+        });
+        return variable;
+    }
+
+    variable = variable.replace(/^this/, '_this.__currentContext');
+
+    if (exports.isLiteral(variable)) {
+        return variable;
+    }
+    if (typeof context === 'string' && context.length) {
+        variable = context + '.' + variable;
+    }
+
+    var chain = '',
+        props = variable.split(/(\.|\[|\])/),
+        inArr = false,
+        prevDot = false;
+
+    props = _.reject(props, function (val) {
+        return val === '';
+    });
+
+    _.each(props, function (prop) {
+        if (prop === '.') {
+            prevDot = true;
+            return;
+        }
+
+        if (prop === '[') {
+            inArr = true;
+            return;
+        }
+
+        if (prop === ']') {
+            inArr = false;
+            return;
+        }
+
+        if (!chain) {
+            chain = prop;
+        } else if (inArr) {
+            if (!exports.isStringLiteral(prop)) {
+                if (prevDot) {
+                    chain = chain.replace(/\]$/, '_' + prop + ']');
+                } else {
+                    chain += '[___' + prop + ']';
+                }
+            } else {
+                chain += '[' + prop + ']';
+            }
+        } else {
+            chain += '.' + prop;
+        }
+        prevDot = false;
+    });
+
+    return chain;
+};
+
+exports.wrapMethod = function (variable, filter, context) {
+    var output = '(function () {\n',
+        args;
+
+    variable = variable || '""';
+
+    if (!filter) {
+        return variable;
+    }
+
+    args = filter.args.split(',');
+    args = _.map(args, function (value) {
+        var varname,
+            stripped = value.replace(/^\s+/, '');
+
+        try {
+            varname = '__' + parser.parseVariable(stripped).name.replace(/\W/g, '_');
+        } catch (e) {
+            return value;
+        }
+
+        if (exports.isValidName(stripped)) {
+            output += exports.setVar(varname, parser.parseVariable(stripped));
+            return varname;
+        }
+
+        return value;
+    });
+
+    args = (args && args.length) ? args.join(',') : '""';
+    output += 'return ';
+    output += (context) ? context + '["' : '';
+    output += filter.name;
+    output += (context) ? '"]' : '';
+    output += '.call(this';
+    output += (args.length) ? ', ' + args : '';
+    output += ');\n';
+
+    return output + '})()';
+};
+
+exports.wrapFilter = function (variable, filter) {
+    var output = '',
+        args = '';
+
+    variable = variable || '""';
+
+    if (!filter) {
+        return variable;
+    }
+
+    if (filters.hasOwnProperty(filter.name)) {
+        args = (filter.args) ? variable + ', ' + filter.args : variable;
+        output += exports.wrapMethod(variable, { name: filter.name, args: args }, '_filters');
+    }
+
+    return output;
+};
+
+exports.wrapFilters = function (variable, filters, context, escape) {
+    var output = exports.escapeVarName(variable, context);
+
+    if (filters && filters.length > 0) {
+        _.each(filters, function (filter) {
+            switch (filter.name) {
+            case 'raw':
+                escape = false;
+                return;
+            case 'e':
+            case 'escape':
+                escape = filter.args || escape;
+                return;
+            default:
+                output = exports.wrapFilter(output, filter, '_filters');
+                break;
+            }
+        });
+    }
+
+    output = output || '""';
+    if (escape) {
+        output = '_filters.escape.call(this, ' + output + ', ' + escape + ')';
+    }
+
+    return output;
+};
+
+exports.setVar = function (varName, argument) {
+    var out = '',
+        props,
+        output,
+        inArr;
+    if ((/\[/).test(argument.name)) {
+        props = argument.name.split(/(\[|\])/);
+        output = [];
+        inArr = false;
+
+        _.each(props, function (prop) {
+            if (prop === '') {
+                return;
+            }
+
+            if (prop === '[') {
+                inArr = true;
+                return;
+            }
+
+            if (prop === ']') {
+                inArr = false;
+                return;
+            }
+
+            if (inArr && !exports.isStringLiteral(prop)) {
+                out += exports.setVar('___' + prop.replace(/\W/g, '_'), { name: prop, filters: [], escape: true });
+            }
+        });
+    }
+    out += 'var ' + varName + ' = "";\n' +
+        'if (' + check(argument.name) + ') {\n' +
+        '    ' + varName + ' = ' + exports.wrapFilters(argument.name, argument.filters, null, argument.escape)  + ';\n' +
+        '} else if (' + check(argument.name, '_context') + ') {\n' +
+        '    ' + varName + ' = ' + exports.wrapFilters(argument.name, argument.filters, '_context', argument.escape) + ';\n' +
+        '}\n';
+
+    if (argument.filters.length) {
+        out += ' else if (true) {\n';
+        out += '    ' + varName + ' = ' + exports.wrapFilters('', argument.filters, null, argument.escape) + ';\n';
+        out += '}\n';
+    }
+
+    return out;
+};
+
+exports.parseIfArgs = function (args, parser) {
+    var operators = ['==', '<', '>', '!=', '<=', '>=', '===', '!==', '&&', '||', 'in', 'and', 'or'],
+        errorString = 'Bad if-syntax in `{% if ' + args.join(' ') + ' %}...',
+        tokens = [],
+        prevType,
+        last,
+        closing = 0;
+
+    _.each(args, function (value, index) {
+        var endsep = false,
+            operand;
+
+        if ((/^\(/).test(value)) {
+            closing += 1;
+            value = value.substr(1);
+            tokens.push({ type: 'separator', value: '(' });
+        }
+
+        if ((/^\![^=]/).test(value) || (value === 'not')) {
+            if (value === 'not') {
+                value = '';
+            } else {
+                value = value.substr(1);
+            }
+            tokens.push({ type: 'operator', value: '!' });
+        }
+
+        if ((/\)$/).test(value)) {
+            if (!closing) {
+                throw new Error(errorString);
+            }
+            value = value.replace(/\)$/, '');
+            endsep = true;
+            closing -= 1;
+        }
+
+        if (value === 'in') {
+            last = tokens.pop();
+            prevType = 'inindex';
+        } else if (_.indexOf(operators, value) !== -1) {
+            if (prevType === 'operator') {
+                throw new Error(errorString);
+            }
+            value = value.replace('and', '&&').replace('or', '||');
+            tokens.push({
+                value: value
+            });
+            prevType = 'operator';
+        } else if (value !== '') {
+            if (prevType === 'value') {
+                throw new Error(errorString);
+            }
+            operand = parser.parseVariable(value);
+
+            if (prevType === 'inindex') {
+                tokens.push({
+                    preout: last.preout + exports.setVar('__op' + index, operand),
+                    value: '(((_.isArray(__op' + index + ') || typeof __op' + index + ' === "string") && _.indexOf(__op' + index + ', ' + last.value + ') !== -1) || (typeof __op' + index + ' === "object" && ' + last.value + ' in __op' + index + '))'
+                });
+                last = null;
+            } else {
+                tokens.push({
+                    preout: exports.setVar('__op' + index, operand),
+                    value: '__op' + index
+                });
+            }
+            prevType = 'value';
+        }
+
+        if (endsep) {
+            tokens.push({ type: 'separator', value: ')' });
+        }
+    });
+
+    if (closing > 0) {
+        throw new Error(errorString);
+    }
+
+    return tokens;
+};
+})(helpers);
+(function (exports) {
     _months = {
         full: ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'],
         abbr: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -275,7 +689,7 @@ exports.compile = function (source, options) {
 /*
 DateZ is licensed under the MIT License:
 Copyright (c) 2011 Tomo Universalis (http://tomouniversalis.com)
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions: 
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
@@ -375,14 +789,15 @@ exports.l = function (input) {
     return _days.full[input.getDay()];
 };
 exports.N = function (input) {
-    return input.getDay();
+    var d = input.getDay();
+    return (d >= 1) ? d + 1 : 7;
 };
 exports.S = function (input) {
     var d = input.getDate();
     return (d % 10 === 1 && d !== 11 ? 'st' : (d % 10 === 2 && d !== 12 ? 'nd' : (d % 10 === 3 && d !== 13 ? 'rd' : 'th')));
 };
 exports.w = function (input) {
-    return input.getDay() - 1;
+    return input.getDay();
 };
 exports.z = function (input, offset, abbr) {
     var year = input.getFullYear(),
@@ -603,9 +1018,8 @@ exports.escape = exports.e = function (input, type) {
             .replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;')
             .replace(/'/g, '&#39;');
-    } else {
-        return input;
     }
+    return input;
 };
 
 exports.first = function (input) {
@@ -623,15 +1037,16 @@ exports.first = function (input) {
 exports.join = function (input, separator) {
     if (_.isArray(input)) {
         return input.join(separator);
-    } else if (typeof input === 'object') {
+    }
+
+    if (typeof input === 'object') {
         var out = [];
         _.each(input, function (value, key) {
             out.push(value);
         });
         return out.join(separator);
-    } else {
-        return input;
     }
+    return input;
 };
 
 exports.json_encode = function (input) {
@@ -675,9 +1090,8 @@ exports.replace = function (input, search, replacement, flags) {
 exports.reverse = function (input) {
     if (_.isArray(input)) {
         return input.reverse();
-    } else {
-        return input;
     }
+    return input;
 };
 
 exports.striptags = function (input) {
@@ -725,239 +1139,10 @@ exports.url_decode = function (input) {
 };
 })(filters);
 (function (exports) {
-    // Javascript keywords can't be a name: 'for.is_invalid' as well as 'for' but not 'for_' or '_for'
-    KEYWORDS = /^(Array|ArrayBuffer|Boolean|Date|Error|eval|EvalError|Function|Infinity|Iterator|JSON|Math|Namespace|NaN|Number|Object|QName|RangeError|ReferenceError|RegExp|StopIteration|String|SyntaxError|TypeError|undefined|uneval|URIError|XML|XMLList|break|case|catch|continue|debugger|default|delete|do|else|finally|for|function|if|in|instanceof|new|return|switch|this|throw|try|typeof|var|void|while|with)(?=(\.|$))/;
-
-// Returns TRUE if the passed string is a valid javascript string literal
-exports.isStringLiteral = function (string) {
-    if (typeof string !== 'string') {
-        return false;
-    }
-
-    var first = string.substring(0, 1),
-        last = string.charAt(string.length - 1, 1),
-        teststr;
-
-    if ((first === last) && (first === "'" || first === '"')) {
-        teststr = string.substr(1, string.length - 2).split('').reverse().join('');
-
-        if ((first === "'" && (/'(?!\\)/).test(teststr)) || (last === '"' && (/"(?!\\)/).test(teststr))) {
-            throw new Error('Invalid string literal. Unescaped quote (' + string[0] + ') found.');
-        }
-
-        return true;
-    }
-
-    return false;
-};
-
-// Returns TRUE if the passed string is a valid javascript number or string literal
-exports.isLiteral = function (string) {
-    var literal = false;
-
-    // Check if it's a number literal
-    if ((/^\d+([.]\d+)?$/).test(string)) {
-        literal = true;
-    } else if (exports.isStringLiteral(string)) {
-        literal = true;
-    }
-
-    return literal;
-};
-
-// Variable names starting with __ are reserved.
-exports.isValidName = function (string) {
-    return ((typeof string === 'string')
-        && string.substr(0, 2) !== '__'
-        && (/^([$A-Za-z_]+[$A-Za-z_0-9]*)(\.?([$A-Za-z_]+[$A-Za-z_0-9]*))*$/).test(string)
-        && !KEYWORDS.test(string));
-};
-
-// Variable names starting with __ are reserved.
-exports.isValidShortName = function (string) {
-    return string.substr(0, 2) !== '__' && (/^[$A-Za-z_]+[$A-Za-z_0-9]*$/).test(string) && !KEYWORDS.test(string);
-};
-
-// Checks if a name is a vlaid block name
-exports.isValidBlockName = function (string) {
-    return (/^[A-Za-z]+[A-Za-z_0-9]*$/).test(string);
-};
-
-/**
-* Returns a valid javascript code that will
-* check if a variable (or property chain) exists
-* in the evaled context. For example:
-*    check('foo.bar.baz')
-* will return the following string:
-*    typeof foo !== 'undefined' && typeof foo.bar !== 'undefined' && typeof foo.bar.baz !== 'undefined'
-*/
-function check(variable, context) {
-    if (_.isArray(variable)) {
-        return '(true)';
-    }
-
-    variable = variable.replace(/^this/, '__this.__currentContext');
-
-    if (exports.isLiteral(variable)) {
-        return '(true)';
-    }
-
-    var props = variable.split(/(\.|\[|\])/),
-        chain = '',
-        output = [];
-
-    if (typeof context === 'string' && context.length) {
-        props.unshift(context);
-    }
-
-    props = _.reject(props, function (val) {
-        return val === '' || val === '.' || val === '[' || val === ']';
-    });
-
-    _.each(props, function (prop) {
-        chain += chain ? ((isNaN(prop) && !exports.isStringLiteral(prop)) ? '.' + prop : '[' + prop + ']') : prop;
-        output.push('typeof ' + chain + ' !== "undefined"');
-    });
-
-    return '(' + output.join(' && ') + ')';
-}
-exports.check = check;
-
-/**
-* Returns an escaped string (safe for evaling). If context is passed
-* then returns a concatenation of context and the escaped variable name.
-*/
-exports.escapeVarName = function (variable, context) {
-    if (_.isArray(variable)) {
-        _.each(variable, function (val, key) {
-            variable[key] = exports.escapeVarName(val, context);
-        });
-        return variable;
-    }
-
-    variable = variable.replace(/^this/, '__this.__currentContext');
-
-    if (exports.isLiteral(variable)) {
-        return variable;
-    } else if (typeof context === 'string' && context.length) {
-        variable = context + '.' + variable;
-    }
-
-    var chain = '', props = variable.split('.');
-    _.each(props, function (prop) {
-        chain += (chain ? ((isNaN(prop) && !exports.isStringLiteral(prop)) ? '.' + prop : '[' + prop + ']') : prop);
-    });
-
-    return chain.replace(/\n/g, '\\n').replace(/\r/g, '\\r');
-};
-
-exports.wrapMethod = function (variable, filter, context) {
-    var output = '(function () {\n',
-        args;
-
-    variable = variable || '""';
-
-    if (!filter) {
-        return variable;
-    }
-
-    args = filter.args.split(',');
-    args = _.map(args, function (value) {
-        var varname,
-            stripped = value.replace(/^\s+/, '');
-
-        try {
-            varname = '__' + parser.parseVariable(stripped).name.replace(/\W/g, '_');
-        } catch (e) {
-            return value;
-        }
-
-        if (exports.isValidName(stripped)) {
-            output += exports.setVar(varname, parser.parseVariable(stripped));
-            return varname;
-        }
-
-        return value;
-    });
-
-    args = (args && args.length) ? args.join(',') : '""';
-    if (args.length) {
-        output += 'return ' + context + '["' + filter.name + '"].call(this, ' + args + ');\n';
-    } else {
-        output += 'return ' + context + '["' + filter.name + '"].call(this);\n';
-    }
-
-    return output + '})()';
-};
-
-exports.wrapFilter = function (variable, filter) {
-    var output = '',
-        args = '';
-
-    variable = variable || '""';
-
-    if (!filter) {
-        return variable;
-    }
-
-    if (filters.hasOwnProperty(filter.name)) {
-        args = (filter.args) ? variable + ', ' + filter.args : variable;
-        output += exports.wrapMethod(variable, { name: filter.name, args: args }, '__filters');
-    }
-
-    return output;
-};
-
-exports.wrapFilters = function (variable, filters, context, escape) {
-    var output = exports.escapeVarName(variable, context);
-
-    if (filters && filters.length > 0) {
-        _.each(filters, function (filter) {
-            switch (filter.name) {
-            case 'raw':
-                escape = false;
-                return;
-            case 'e':
-            case 'escape':
-                escape = filter.args || escape;
-                return;
-            default:
-                output = exports.wrapFilter(output, filter, '__filters');
-                break;
-            }
-        });
-    }
-
-    output = output || '""';
-    if (escape) {
-        output = '__filters.escape.call(this, ' + output + ', ' + escape + ')';
-    }
-
-    return output;
-};
-
-exports.setVar = function (varName, argument) {
-    var out = 'var ' + varName + ' = "";\n' +
-        'if (' + check(argument.name) + ') {\n' +
-        '    ' + varName + ' = ' + exports.wrapFilters(exports.escapeVarName(argument.name), argument.filters, null, argument.escape)  + ';\n' +
-        '} else if (' + check(argument.name, '__context') + ') {\n' +
-        '    ' + varName + ' = ' + exports.wrapFilters(exports.escapeVarName(argument.name), argument.filters, '__context', argument.escape) + ';\n' +
-        '}\n';
-
-    if (argument.filters.length) {
-        out += ' else if (true) {\n';
-        out += '    ' + varName + ' = ' + exports.wrapFilters('', argument.filters, null, argument.escape) + ';\n';
-        out += '}\n';
-    }
-
-    return out;
-};
-})(helpers);
-(function (exports) {
 
     variableRegexp  = /^\{\{.*?\}\}$/,
-    logicRegexp     = /^\{%.*?%\}$/,
-    commentRegexp   = /^\{#.*?#\}$/,
+    logicRegexp     = /^\{%[^\r]*?%\}$/,
+    commentRegexp   = /^\{#[^\r]*?#\}$/,
 
     TEMPLATE = exports.TEMPLATE = 0,
     LOGIC_TOKEN = 1,
@@ -1010,7 +1195,7 @@ function getTokenArgs(token, parts) {
 
     for (i; i < l; i += 1) {
         arg = parts[i];
-        if (arg === null) {
+        if (arg === null || (/^\s+$/).test(arg)) {
             continue;
         }
 
@@ -1102,7 +1287,7 @@ exports.parseVariable = function (token, escape) {
 };
 
 exports.parse = function (data, tags, autoescape) {
-    var rawtokens = data.replace(/(^\s+)|(\s+$)/g, '').split(/(\{%.*?%\}|\{\{.*?\}\}|\{#.*?#\})/),
+    var rawtokens = data.replace(/(^\s+)|(\s+$)/g, '').split(/(\{%[^\r]*?%\}|\{\{.*?\}\}|\{#[^\r]*?#\})/),
         escape = !!autoescape,
         last_escape = escape,
         stack = [[]],
@@ -1124,12 +1309,21 @@ exports.parse = function (data, tags, autoescape) {
         lastToken,
         rawStart = /^\{\% *raw *\%\}/,
         rawEnd = /\{\% *endraw *\%\}$/,
-        inRaw = false;
+        inRaw = false,
+        stripAfter = false,
+        stripBefore = false,
+        stripStart = false,
+        stripEnd = false;
 
     for (i; i < j; i += 1) {
         token = rawtokens[i];
         curline = lines;
         newlines = token.match(/\n/g);
+        stripAfter = false;
+        stripBefore = false;
+        stripStart = false;
+        stripEnd = false;
+
         if (newlines) {
             lines += newlines.length;
         }
@@ -1161,15 +1355,25 @@ exports.parse = function (data, tags, autoescape) {
                 continue;
             }
 
-            parts = token.replace(/^\{% *| *%\}$/g, '').split(' ');
+            parts = token.replace(/^\{%\s*|\s*%\}$/g, '').split(' ');
+            if (parts[0] === '-') {
+                stripBefore = true;
+                parts.shift();
+            }
             tagname = parts.shift();
+            if (_.last(parts) === '-') {
+                stripAfter = true;
+                parts.pop();
+            }
 
             if (index > 0 && (/^end/).test(tagname)) {
                 lastToken = _.last(stack[stack.length - 2]);
                 if ('end' + lastToken.name === tagname) {
-                    if (_.last(stack).name === 'autoescape') {
+                    if (lastToken.name === 'autoescape') {
                         escape = last_escape;
                     }
+                    lastToken.strip.end = stripBefore;
+                    lastToken.strip.after = stripAfter;
                     stack.pop();
                     index -= 1;
                     continue;
@@ -1184,7 +1388,7 @@ exports.parse = function (data, tags, autoescape) {
 
             if (tagname === 'autoescape') {
                 last_escape = escape;
-                escape = (!parts.length || parts[0] === 'on') ? ((parts.length >= 2) ? parts[1] : true) : false;
+                escape = (!parts.length || parts[0] === 'true') ? ((parts.length >= 2) ? parts[1] : true) : false;
             }
 
             token = {
@@ -1192,11 +1396,19 @@ exports.parse = function (data, tags, autoescape) {
                 line: curline,
                 name: tagname,
                 compile: tags[tagname],
-                parent: _.uniq(stack[stack.length - 2])
+                parent: _.uniq(stack[stack.length - 2] || []),
+                strip: {
+                    before: stripBefore,
+                    after: stripAfter,
+                    start: false,
+                    end: false
+                }
             };
             token.args = getTokenArgs(token, parts);
 
             if (tags[tagname].ends) {
+                token.strip.after = false;
+                token.strip.start = stripAfter;
                 stack[index].push(token);
                 stack.push(token.tokens = []);
                 index += 1;
@@ -1223,10 +1435,12 @@ exports.parse = function (data, tags, autoescape) {
 exports.compile = function compile(indent, parentBlock) {
     var code = '',
         tokens = [],
+        sets = [],
         parent,
         filepath,
         blockname,
-        varOutput;
+        varOutput,
+        wrappedInMethod;
 
     indent = indent || '';
 
@@ -1262,20 +1476,33 @@ exports.compile = function compile(indent, parentBlock) {
                 } catch (error) {
                     throw new Error('Circular extends found on line ' + token.line + ' of "' + this.id + '"!');
                 }
+            } else if (token.name === 'set') {
+                sets.push(token);
+                return;
             }
             tokens.push(token);
         }, this);
 
         if (tokens.length && tokens[0].name === 'extends') {
             this.blocks = _.extend({}, this.parent.blocks, this.blocks);
-            this.tokens = this.parent.tokens;
+            this.tokens = sets.concat(this.parent.tokens);
         }
+        sets = tokens = null;
     }
 
     // If this is not a template then just iterate through its tokens
     _.each(this.tokens, function (token, index) {
+        var name, key, args, prev, next;
         if (typeof token === 'string') {
-            code += '__output += "' + doubleEscape(token).replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/"/g, '\\"') + '";\n';
+            prev = this.tokens[index - 1];
+            next = this.tokens[index + 1];
+            if (prev && prev.strip && prev.strip.after) {
+                token = token.replace(/^\s+/, '');
+            }
+            if (next && next.strip && next.strip.before) {
+                token = token.replace(/\s+$/, '');
+            }
+            code += '_output += "' + doubleEscape(token).replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/"/g, '\\"') + '";\n';
             return code;
         }
 
@@ -1284,14 +1511,21 @@ exports.compile = function compile(indent, parentBlock) {
         }
 
         if (token.type === VAR_TOKEN) {
-            var name = token.name.replace(/\W/g, '_'),
-                args = (token.args && token.args.length) ? token.args : '';
+            name = token.name.replace(/\W/g, '_');
+            key = (helpers.isLiteral(name)) ? '["' + name + '"]' : '.' + name;
+            args = (token.args && token.args.length) ? token.args : '';
 
-            code += 'if (typeof __context !== "undefined" && typeof __context.' + name + ' === "function") {\n';
-            code += '    __output += ' + helpers.wrapMethod('', { name: name, args: args }, '__context') + ';\n';
+            code += 'if (typeof _context !== "undefined" && typeof _context' + key + ' === "function") {\n';
+            wrappedInMethod = helpers.wrapMethod('', { name: name, args: args }, '_context');
+            code += '    _output = (typeof _output === "undefined") ? ' + wrappedInMethod + ': _output + ' + wrappedInMethod + ';\n';
+            if (helpers.isValidName(name)) {
+                code += '} else if (typeof ' + name + ' === "function") {\n';
+                wrappedInMethod = helpers.wrapMethod('', { name: name, args: args });
+                code += '    _output = (typeof _output === "undefined") ? ' + wrappedInMethod + ': _output + ' + wrappedInMethod + ';\n';
+            }
             code += '} else {\n';
             code += helpers.setVar('__' + name, token);
-            code += '    __output += __' + name + ';\n';
+            code += '    _output = (typeof _output === "undefined") ? __' + name + ': _output + __' + name + ';\n';
             code += '}\n';
         }
 
@@ -1310,7 +1544,13 @@ exports.compile = function compile(indent, parentBlock) {
         } else if (token.name === 'parent') {
             code += indent + '  ' + parentBlock;
         } else {
-            code += token.compile(indent + '  ');
+            if (token.strip.start && token.tokens.length && typeof token.tokens[0] === 'string') {
+                token.tokens[0] = token.tokens[0].replace(/^\s+/, '');
+            }
+            if (token.strip.end && token.tokens.length && typeof _.last(token.tokens) === 'string') {
+                token.tokens[token.tokens.length - 1] = _.last(token.tokens).replace(/\s+$/, '');
+            }
+            code += token.compile(indent + '  ', parentBlock, exports);
         }
 
     }, this);
@@ -1318,30 +1558,19 @@ exports.compile = function compile(indent, parentBlock) {
     return code;
 };
 })(parser);
-(function (exports) {
+tags['include'] = (function () {
+module = {};
 
 /**
-* Inheritance inspired by Django templates
-* The 'extends' and 'block' logic is hardwired in parser.compile
-* These are dummy tags.
-*/
-exports['extends'] = {};
-exports.block = { ends: true };
-exports.parent = {};
-exports.raw = { ends: true };
-
-/**
-* Includes another template. The included template will have access to the
-* context, but won't have access to the variables defined in the parent template,
-* like for loop counters.
-*
-* Usage:
-*    {% include context_variable %}
-* or
-*    {% include 'template_name.html' %}
-*/
-exports.include = function (indent) {
-    var template = this.args[0];
+ * include
+ */
+module.exports = function (indent, parentBlock, parser) {
+    var args = _.clone(this.args),
+        template = args.shift(),
+        context = '_context',
+        ignore = false,
+        out = '',
+        ctx;
 
     indent = indent || '';
 
@@ -1349,129 +1578,212 @@ exports.include = function (indent) {
         throw new Error('Invalid arguments passed to \'include\' tag.');
     }
 
-    // Circular includes are VERBOTTEN. This will crash the server.
-    return [
-        '(function () {',
-        helpers.setVar('__template', parser.parseVariable(template)),
-        '    if (typeof __template === "string") {',
-        '        __output += __this.compileFile(__template).render(__context, __parents);',
-        '    }',
-        '})();'
-    ].join('\n' + indent);
-};
-
-function parseIfArgs(args) {
-    var operators = ['==', '<', '>', '!=', '<=', '>=', '===', '!==', '&&', '||', 'in', 'and', 'or'],
-        errorString = 'Bad if-syntax in `{% if ' + args.join(' ') + ' %}...',
-        tokens = [],
-        prevType,
-        last,
-        closing = 0;
-
-    _.each(args, function (value, index) {
-        var endsep = false,
-            operand;
-
-        if ((/^\(/).test(value)) {
-            closing += 1;
-            value = value.substr(1);
-            tokens.push({ type: 'separator', value: '(' });
+    if (args.length) {
+        if (_.last(args) === 'only') {
+            context = '{}';
+            args.pop();
         }
 
-        if ((/^\![^=]/).test(value) || (value === 'not')) {
-            if (value === 'not') {
-                value = '';
-            } else {
-                value = value.substr(1);
-            }
-            tokens.push({ type: 'operator', value: '!' });
+        if (args.length > 1 && args[0] === 'ignore' & args[1] === 'missing') {
+            args.shift();
+            args.shift();
+            ignore = true;
         }
 
-        if ((/\)$/).test(value)) {
-            if (!closing) {
-                throw new Error(errorString);
-            }
-            value = value.replace(/\)$/, '');
-            endsep = true;
-            closing -= 1;
+        if (args.length && args[0] !== 'with') {
+            throw new Error('Invalid arguments passed to \'include\' tag.');
         }
 
-        if (value === 'in') {
-            last = tokens.pop();
-            prevType = 'inindex';
-        } else if (_.indexOf(operators, value) !== -1) {
-            if (prevType === 'operator') {
-                throw new Error(errorString);
+        if (args[0] === 'with') {
+            args.shift();
+            if (!args.length) {
+                throw new Error('Context for \'include\' tag not provided, but expected after \'with\' token.');
             }
-            value = value.replace('and', '&&').replace('or', '||');
-            tokens.push({
-                value: value
-            });
-            prevType = 'operator';
-        } else if (value !== '') {
-            if (prevType === 'value') {
-                throw new Error(errorString);
-            }
-            operand = parser.parseVariable(value);
 
-            if (prevType === 'inindex') {
-                tokens.push({
-                    preout: last.preout + helpers.setVar('__op' + index, operand),
-                    value: '(((_.isArray(__op' + index + ') || typeof __op' + index + ' === "string") && _.indexOf(__op' + index + ', ' + last.value + ') !== -1) || (typeof __op' + index + ' === "object" && ' + last.value + ' in __op' + index + '))'
-                });
-                last = null;
-            } else {
-                tokens.push({
-                    preout: helpers.setVar('__op' + index, operand),
-                    value: '__op' + index
-                });
-            }
-            prevType = 'value';
+            ctx = args.shift();
+
+            context = '_context["' + ctx + '"] || ' + ctx;
         }
-
-        if (endsep) {
-            tokens.push({ type: 'separator', value: ')' });
-        }
-    });
-
-    if (closing > 0) {
-        throw new Error(errorString);
     }
 
-    return tokens;
-}
+    out = '(function () {\n' +
+        helpers.setVar('__template', parser.parseVariable(template)) + '\n' +
+        '    var includeContext = ' + context + ';\n';
 
-exports['if'] = function (indent) {
-    var args = (parseIfArgs(this.args)),
-        out = '(function () {\n';
+    if (ignore) {
+        out += 'try {\n';
+    }
 
-    _.each(args, function (token) {
-        if (token.hasOwnProperty('preout') && token.preout) {
-            out += token.preout + '\n';
-        }
-    });
+    out += '    if (typeof __template === "string") {\n';
+    out += '        _output += _this.compileFile(__template).render(includeContext, _parents);\n';
+    out += '    }\n';
 
-    out += '\nif (\n';
-    _.each(args, function (token) {
-        out += token.value + ' ';
-    });
-    out += ') {\n';
-    out += parser.compile.call(this, indent + '    ');
-    out += '\n}\n';
+    if (ignore) {
+        out += '} catch (e) {}\n';
+    }
     out += '})();\n';
 
     return out;
 };
-exports['if'].ends = true;
+return module.exports;
+})();
+tags['for'] = (function () {
+module = {};
 
-exports['else'] = function (indent) {
-    if (_.last(this.parent).name !== 'if') {
-        throw new Error('Cannot call else tag outside of "if" context.');
+/**
+* for
+*/
+module.exports = function (indent, parentBlock, parser) {
+    var thisArgs = _.clone(this.args),
+        operand1 = thisArgs[0],
+        operator = thisArgs[1],
+        operand2 = parser.parseVariable(thisArgs[2]),
+        out = '',
+        loopShared;
+
+    indent = indent || '';
+
+    if (typeof operator !== 'undefined' && operator !== 'in') {
+        throw new Error('Invalid syntax in "for" tag');
     }
 
-    var ifarg = this.args.shift(),
-        args = (parseIfArgs(this.args)),
+    if (!helpers.isValidShortName(operand1)) {
+        throw new Error('Invalid arguments (' + operand1 + ') passed to "for" tag');
+    }
+
+    if (!helpers.isValidName(operand2.name)) {
+        throw new Error('Invalid arguments (' + operand2.name + ') passed to "for" tag');
+    }
+
+    operand1 = helpers.escapeVarName(operand1);
+
+    loopShared = 'loop.index = __loopIndex + 1;\n' +
+        'loop.index0 = __loopIndex;\n' +
+        'loop.revindex = __loopLength - loop.index0;\n' +
+        'loop.revindex0 = loop.revindex - 1;\n' +
+        'loop.first = (__loopIndex === 0);\n' +
+        'loop.last = (__loopIndex === __loopLength - 1);\n' +
+        '_context["' + operand1 + '"] = __loopIter[loop.key];\n' +
+        parser.compile.apply(this, [indent + '     ', parentBlock]);
+
+    out = '(function () {\n' +
+        '    var loop = {}, __loopKey, __loopIndex = 0, __loopLength = 0,' +
+        '        __ctx_operand = _context["' + operand1 + '"],\n' +
+        '        loop_cycle = function() {\n' +
+        '            var args = _.toArray(arguments), i = loop.index0 % args.length;\n' +
+        '            return args[i];\n' +
+        '        };\n' +
+        helpers.setVar('__loopIter', operand2) +
+        '    else {\n' +
+        '        return;\n' +
+        '    }\n' +
+        // Basic for loops are MUCH faster than for...in. Prefer this arrays.
+        '    if (_.isArray(__loopIter)) {\n' +
+        '        __loopIndex = 0; __loopLength = __loopIter.length;\n' +
+        '        for (; __loopIndex < __loopLength; __loopIndex += 1) {\n' +
+        '           loop.key = __loopIndex;\n' +
+        loopShared +
+        '        }\n' +
+        '    } else if (typeof __loopIter === "object") {\n' +
+        '        __keys = _.keys(__loopIter);\n' +
+        '        __loopLength = __keys.length;\n' +
+        '        __loopIndex = 0;\n' +
+        '        for (; __loopIndex < __loopLength; __loopIndex += 1) {\n' +
+        '           loop.key = __keys[__loopIndex];\n' +
+        loopShared +
+        '        }\n' +
+        '    }\n' +
+        '    _context["' + operand1 + '"] = __ctx_operand;\n' +
+        '})();\n';
+
+    return out;
+};
+module.exports.ends = true;
+return module.exports;
+})();
+tags['parent'] = (function () {
+module = {};
+/**
+* parent
+*/
+module.exports = {};
+
+return module.exports;
+})();
+tags['autoescape'] = (function () {
+module = {};
+/**
+ * autoescape
+ * Special handling hardcoded into the parser to determine whether variable output should be escaped or not
+ */
+module.exports = function (indent, parentBlock, parser) {
+    return parser.compile.apply(this, [indent, parentBlock]);
+};
+module.exports.ends = true;
+return module.exports;
+})();
+tags['raw'] = (function () {
+module = {};
+/**
+ * raw
+ */
+module.exports = { ends: true };
+return module.exports;
+})();
+tags['macro'] = (function () {
+module = {};
+
+/**
+ * macro
+ */
+module.exports = function (indent, parentBlock, parser) {
+    var thisArgs = _.clone(this.args),
+        macro = thisArgs.shift(),
+        args = '',
         out = '';
+
+    if (thisArgs.length) {
+        args = JSON.stringify(thisArgs).replace(/^\[|\'|\"|\]$/g, '');
+    }
+
+    out += '_context.' + macro + ' = function (' + args + ') {\n';
+    out += '    var _output = "";\n';
+    out += parser.compile.apply(this, [indent + '    ', parentBlock]);
+    out += '    return _output;\n';
+    out += '};\n';
+
+    return out;
+};
+module.exports.ends = true;
+return module.exports;
+})();
+tags['else'] = (function () {
+module = {};
+
+/**
+ * else
+ */
+module.exports = function (indent, parentBlock, parser) {
+    var last = _.last(this.parent).name,
+        thisArgs = _.clone(this.args),
+        ifarg,
+        args,
+        out;
+
+    if (last === 'for') {
+        if (thisArgs.length) {
+            throw new Error('"else" tag cannot accept arguments in the "for" context.');
+        }
+        return '} if (__loopLength === 0) {\n';
+    }
+
+    if (last !== 'if') {
+        throw new Error('Cannot call else tag outside of "if" or "for" context.');
+    }
+
+    ifarg = thisArgs.shift();
+    args = (helpers.parseIfArgs(thisArgs, parser));
+    out = '';
 
     if (ifarg) {
         out += '} else if (\n';
@@ -1497,117 +1809,53 @@ exports['else'] = function (indent) {
 
     return indent + '\n} else {\n';
 };
+return module.exports;
+})();
+tags['if'] = (function () {
+module = {};
 
 /**
-* This is the 'for' tag compiler
-* Example 'For' tag syntax:
-*  {% for x in y.some.items %}
-*    <p>{{x}}</p>
-*  {% endfor %}
-*/
-exports['for'] = function (indent) {
-    var operand1 = this.args[0],
-        operator = this.args[1],
-        operand2 = parser.parseVariable(this.args[2]),
-        out = '',
-        loopShared;
+ * if
+ */
+module.exports = function (indent, parentBlock, parser) {
+    var thisArgs = _.clone(this.args),
+        args = (helpers.parseIfArgs(thisArgs, parser)),
+        out = '(function () {\n';
 
-    indent = indent || '';
+    _.each(args, function (token) {
+        if (token.hasOwnProperty('preout') && token.preout) {
+            out += token.preout + '\n';
+        }
+    });
 
-    if (typeof operator !== 'undefined' && operator !== 'in') {
-        throw new Error('Invalid syntax in "for" tag');
-    }
-
-    if (!helpers.isValidShortName(operand1)) {
-        throw new Error('Invalid arguments (' + operand1 + ') passed to "for" tag');
-    }
-
-    if (!helpers.isValidName(operand2.name)) {
-        throw new Error('Invalid arguments (' + operand2.name + ') passed to "for" tag');
-    }
-
-    operand1 = helpers.escapeVarName(operand1);
-
-    loopShared = 'forloop.index = __forloopIndex;\n' +
-        'forloop.first = (__forloopIndex === 0);\n' +
-        'forloop.last = (__forloopIndex === __forloopLength - 1);\n' +
-        operand1 + ' = __forloopIter[forloop.key];\n' +
-        parser.compile.call(this, indent + '     ');
-
-    out = '(function () {\n' +
-        '    var ' + operand1 + ', forloop = {}, __forloopKey, __forloopIndex = 0, __forloopLength = 0;\n' +
-        helpers.setVar('__forloopIter', operand2) +
-        '    else {\n' +
-        '        return;\n' +
-        '    }\n' +
-        // Basic for loops are MUCH faster than for...in. Prefer this arrays.
-        '    if (_.isArray(__forloopIter)) {\n' +
-        '        __forloopIndex = 0; __forloopLength = __forloopIter.length;\n' +
-        '        for (; __forloopIndex < __forloopLength; __forloopIndex += 1) {\n' +
-        '           forloop.key = __forloopIndex;\n' +
-        loopShared +
-        '        }\n' +
-        '    } else if (typeof __forloopIter === "object") {\n' +
-        '        __keys = _.keys(__forloopIter);\n' +
-        '        __forloopLength = __keys.length;\n' +
-        '        __forloopIndex = 0;\n' +
-        '        for (; __forloopIndex < __forloopLength; __forloopIndex += 1) {\n' +
-        '           forloop.key = __keys[__forloopIndex];\n' +
-        loopShared +
-        '        }\n' +
-        '    }\n' +
-        '})();\n';
+    out += '\nif (\n';
+    _.each(args, function (token) {
+        out += token.value + ' ';
+    });
+    out += ') {\n';
+    out += parser.compile.apply(this, [indent + '    ', parentBlock]);
+    out += '\n}\n';
+    out += '})();\n';
 
     return out;
 };
-exports['for'].ends = true;
-
-exports.empty = function (indent) {
-    if (_.last(this.parent).name !== 'for') {
-        throw new Error('Cannot call "empty" tag outside of "for" context.');
-    }
-
-    return '} if (_.keys(__forloopIter).length === 0) {\n';
-};
+module.exports.ends = true;
+return module.exports;
+})();
+tags['import'] = (function () {
+module = {};
 
 /**
- * autoescape
- * Special handling hardcoded into the parser to determine whether variable output should be escaped or not
+ * import
  */
-exports.autoescape = function (indent) {
-    return parser.compile.call(this, indent);
-};
-exports.autoescape.ends = true;
-
-exports.set = function (indent) {
-    var varname = this.args.shift(),
-        value;
-
-    // remove '='
-    if (this.args.shift() !== '=') {
-        throw new Error('Invalid token "' + this.args[1] + '" in {% set ' + this.args[0] + ' %}. Missing "=".');
-    }
-
-    value = this.args[0];
-    if ((/^\'|^\"|^\{|^\[/).test(value)) {
-        return 'var ' + varname + ' = ' + value + ';';
-    }
-
-    value = parser.parseVariable(value);
-    return 'var ' + varname + ' = ' +
-        '(function () {\n' +
-        '    var __output = "";\n' +
-        parser.compile.call({ tokens: [value] }, indent) + '\n' +
-        ' return __output; })();\n';
-};
-
-exports['import'] = function (indent) {
+module.exports = function (indent, parentBlock, parser) {
     if (this.args.length !== 3) {
     }
 
-    var file = this.args[0],
-        as = this.args[1],
-        name = this.args[2],
+    var thisArgs = _.clone(this.args),
+        file = thisArgs[0],
+        as = thisArgs[1],
+        name = thisArgs[2],
         out = '';
 
     if (!helpers.isLiteral(file) && !helpers.isValidName(file)) {
@@ -1618,55 +1866,92 @@ exports['import'] = function (indent) {
         throw new Error('Invalid syntax {% import "' + file + '" ' + as + ' ' + name + ' %}');
     }
 
-    out += '_.extend(__context, (function () {\n';
+    out += '_.extend(_context, (function () {\n';
 
-    out += 'var __context = {}, __ctx = {}, __output = "";\n' +
+    out += 'var _context = {}, __ctx = {}, _output = "";\n' +
         helpers.setVar('__template', parser.parseVariable(file)) +
-        '__this.compileFile(__template).render(__ctx, __parents);\n' +
+        '_this.compileFile(__template).render(__ctx, _parents);\n' +
         '_.each(__ctx, function (item, key) {\n' +
         '    if (typeof item === "function") {\n' +
-        '        __context["' + name + '_" + key] = item;\n' +
+        '        _context["' + name + '_" + key] = item;\n' +
         '    }\n' +
         '});\n' +
-        'return __context;\n';
+        'return _context;\n';
 
     out += '})());\n';
 
     return out;
 };
+return module.exports;
+})();
+tags['set'] = (function () {
+module = {};
 
-exports.macro = function (indent) {
-    var macro = this.args.shift(),
-        args = '',
-        out = '';
+/**
+ * set
+ */
+module.exports = function (indent, parentBlock, parser) {
+    var thisArgs = _.clone(this.args),
+        varname = helpers.escapeVarName(thisArgs.shift(), '_context'),
+        value;
 
-    if (this.args.length) {
-        args = JSON.stringify(this.args).replace(/^\[|\'|\"|\]$/g, '');
+    // remove '='
+    if (thisArgs.shift() !== '=') {
+        throw new Error('Invalid token "' + thisArgs[1] + '" in {% set ' + thisArgs[0] + ' %}. Missing "=".');
     }
 
-    out += '__context.' + macro + ' = function (' + args + ') {\n';
-    out += '    var __output = "";\n';
-    out += parser.compile.call(this, indent + '    ');
-    out += '    return __output;\n';
-    out += '};\n';
+    value = thisArgs[0];
+    if (helpers.isLiteral(value) || (/^\{|^\[/).test(value) || value === 'true' || value === 'false') {
+        return ' ' + varname + ' = ' + value + ';';
+    }
 
-    return out;
+    value = parser.parseVariable(value);
+    return ' ' + varname + ' = ' +
+        '(function () {\n' +
+        '    var _output;\n' +
+        parser.compile.apply({ tokens: [value] }, [indent, parentBlock]) + '\n' +
+        '    return _output;\n' +
+        '})();\n';
 };
-exports.macro.ends = true;
+return module.exports;
+})();
+tags['filter'] = (function () {
+module = {};
 
-exports.filter = function (indent) {
-    var name = this.args.shift(),
-        args = (this.args.length) ? this.args.join(', ') : '',
+/**
+ * filter
+ */
+module.exports = function (indent, parentBlock, parser) {
+    var thisArgs = _.clone(this.args),
+        name = thisArgs.shift(),
+        args = (thisArgs.length) ? thisArgs.join(', ') : '',
         value = '(function () {\n';
-    value += '    var __output = "";\n';
-    value += parser.compile.call(this, indent + '    ') + '\n';
-    value += '    return __output;\n';
+    value += '    var _output = "";\n';
+    value += parser.compile.apply(this, [indent + '    ', parentBlock]) + '\n';
+    value += '    return _output;\n';
     value += '})()\n';
 
-    return '__output += ' + helpers.wrapFilter(value.replace(/\n/g, ''), { name: name, args: args }) + ';\n';
+    return '_output += ' + helpers.wrapFilter(value.replace(/\n/g, ''), { name: name, args: args }) + ';\n';
 };
-exports.filter.ends = true;
-})(tags);
+module.exports.ends = true;
+return module.exports;
+})();
+tags['block'] = (function () {
+module = {};
+/**
+ * block
+ */
+module.exports = { ends: true };
+return module.exports;
+})();
+tags['extends'] = (function () {
+module = {};
+/**
+ * extends
+ */
+module.exports = {};
+return module.exports;
+})();
 return swig;
 })();
 }(require("underscore"));
