@@ -144,37 +144,9 @@ function TemplateError(error) {
     }};
 }
 
-function createTemplate(data, id) {
-    var template = {
-            // Allows us to include templates from the compiled code
-            compileFile: exports.compileFile,
-            // These are the blocks inside the template
-            blocks: {},
-            // Distinguish from other tokens
-            type: parser.TEMPLATE,
-            // The template ID (path relative to tempalte dir)
-            id: id
-        },
-        tokens,
-        code,
-        render;
-
-    // The template token tree before compiled into javascript
-    if (_config.allowErrors) {
-        template.tokens = parser.parse.call(template, data, _config.tags, _config.autoescape);
-    } else {
-        try {
-            template.tokens = parser.parse.call(template, data, _config.tags, _config.autoescape);
-        } catch (e) {
-            return new TemplateError(e);
-        }
-    }
-
-    // The raw template code
-    code = parser.compile.call(template);
-
+function createRenderFunc(code) {
     // The compiled render function - this is all we need
-    render = new Function('_context', '_parents', '_filters', '_', '_ext', [
+    return new Function('_context', '_parents', '_filters', '_', '_ext', [
         '_parents = _parents ? _parents.slice() : [];',
         '_context = _context || {};',
         // Prevents circular includes (which will crash node without warning)
@@ -192,6 +164,49 @@ function createTemplate(data, id) {
         code,
         'return _output;',
     ].join(''));
+}
+
+function createTemplate(data, id) {
+    var template = {
+            // Allows us to include templates from the compiled code
+            compileFile: exports.compileFile,
+            // These are the blocks inside the template
+            blocks: {},
+            // Distinguish from other tokens
+            type: parser.TEMPLATE,
+            // The template ID (path relative to tempalte dir)
+            id: id
+        },
+        tokens,
+        code,
+        render;
+
+    // The template token tree before compiled into javascript
+    if (_config.allowErrors) {
+        tokens = parser.parse.call(template, data, _config.tags, _config.autoescape);
+    } else {
+        try {
+            tokens = parser.parse.call(template, data, _config.tags, _config.autoescape);
+        } catch (e) {
+            return new TemplateError(e);
+        }
+    }
+
+    template.tokens = tokens;
+
+    // The raw template code
+    code = parser.compile.call(template);
+
+    if (code !== false) {
+        render = createRenderFunc(code);
+    } else {
+        render = function (_context, _parents, _filters, _, _ext) {
+            template.tokens = tokens;
+            code = parser.compile.call(template, null, '', _context);
+            var fn = createRenderFunc(code);
+            return fn.call(this, _context, _parents, _filters, _, _ext);
+        };
+    }
 
     template.render = function (context, parents) {
         if (_config.allowErrors) {
@@ -1049,8 +1064,8 @@ exports.join = function (input, separator) {
     return input;
 };
 
-exports.json_encode = function (input) {
-    return JSON.stringify(input);
+exports.json_encode = function (input, indent) {
+    return JSON.stringify(input, null, indent || 0);
 };
 
 exports.last = function (input) {
@@ -1166,6 +1181,14 @@ function getArgs(input) {
     return doubleEscape(input.replace(/^[\w\.]+\(|\)$/g, ''));
 }
 
+function getContextVar(varName, context) {
+    var a = varName.split(".");
+    while (a.length) {
+        context = context[a.splice(0, 1)[0]];
+    }
+    return context;
+}
+
 function getTokenArgs(token, parts) {
     parts = _.map(parts, doubleEscape);
 
@@ -1187,7 +1210,7 @@ function getTokenArgs(token, parts) {
         }
 
         if (!end.test(out)) {
-            throw new Error('Malformed arguments sent to tag.');
+            throw new Error('Malformed arguments ' + out + ' sent to tag.');
         }
 
         return out.replace(/^ /, '');
@@ -1432,7 +1455,7 @@ exports.parse = function (data, tags, autoescape) {
     return stack[index];
 };
 
-exports.compile = function compile(indent, parentBlock) {
+exports.compile = function compile(indent, parentBlock, context) {
     var code = '',
         tokens = [],
         sets = [],
@@ -1440,48 +1463,70 @@ exports.compile = function compile(indent, parentBlock) {
         filepath,
         blockname,
         varOutput,
-        wrappedInMethod;
+        wrappedInMethod,
+        extendsHasVar;
 
     indent = indent || '';
 
     // Precompile - extract blocks and create hierarchy based on 'extends' tags
     // TODO: make block and extends tags accept context variables
     if (this.type === TEMPLATE) {
+
         _.each(this.tokens, function (token, index) {
-            // Load the parent template
-            if (token.name === 'extends') {
-                filepath = token.args[0];
-                if (!helpers.isStringLiteral(filepath) || token.args.length > 1) {
-                    throw new Error('Extends tag on line ' + token.line + ' accepts exactly one string literal as an argument.');
-                }
-                if (index > 0) {
-                    throw new Error('Extends tag must be the first tag in the template, but "extends" found on line ' + token.line + '.');
-                }
-                token.template = this.compileFile(filepath.replace(/['"]/g, ''));
-                this.parent = token.template;
-            } else if (token.name === 'block') { // Make a list of blocks
-                blockname = token.args[0];
-                if (!helpers.isValidBlockName(blockname) || token.args.length !== 1) {
-                    throw new Error('Invalid block tag name "' + blockname + '" on line ' + token.line + '.');
-                }
-                if (this.type !== TEMPLATE) {
-                    throw new Error('Block "' + blockname + '" found nested in another block tag on line' + token.line + '.');
-                }
-                try {
-                    if (this.hasOwnProperty('parent') && this.parent.blocks.hasOwnProperty(blockname)) {
-                        this.blocks[blockname] = compile.call(token, indent + '  ', this.parent.blocks[blockname]);
-                    } else if (this.hasOwnProperty('blocks')) {
-                        this.blocks[blockname] = compile.call(token, indent + '  ');
+
+            if (!extendsHasVar) {
+                // Load the parent template
+                if (token.name === 'extends') {
+                    filepath = token.args[0];
+
+                    if (!helpers.isStringLiteral(filepath)) {
+
+                        if (!context) {
+                            extendsHasVar = true;
+                            return;
+                        }
+                        filepath = "\"" + getContextVar(filepath, context) + "\"";
                     }
-                } catch (error) {
-                    throw new Error('Circular extends found on line ' + token.line + ' of "' + this.id + '"!');
+
+                    if (!helpers.isStringLiteral(filepath) || token.args.length > 1) {
+                        throw new Error('Extends tag on line ' + token.line + ' accepts exactly one string literal as an argument.');
+                    }
+                    if (index > 0) {
+                        throw new Error('Extends tag must be the first tag in the template, but "extends" found on line ' + token.line + '.');
+                    }
+                    token.template = this.compileFile(filepath.replace(/['"]/g, ''));
+                    this.parent = token.template;
+
+                } else if (token.name === 'block') { // Make a list of blocks
+                    blockname = token.args[0];
+                    if (!helpers.isValidBlockName(blockname) || token.args.length !== 1) {
+                        throw new Error('Invalid block tag name "' + blockname + '" on line ' + token.line + '.');
+                    }
+                    if (this.type !== TEMPLATE) {
+                        throw new Error('Block "' + blockname + '" found nested in another block tag on line' + token.line + '.');
+                    }
+                    try {
+                        if (this.hasOwnProperty('parent') && this.parent.blocks.hasOwnProperty(blockname)) {
+                            this.blocks[blockname] = compile.call(token, indent + '  ', this.parent.blocks[blockname]);
+                        } else if (this.hasOwnProperty('blocks')) {
+                            this.blocks[blockname] = compile.call(token, indent + '  ');
+                        }
+                    } catch (error) {
+                        throw new Error('Circular extends found on line ' + token.line + ' of "' + this.id + '"!');
+                    }
+                } else if (token.name === 'set') {
+                    sets.push(token);
+                    return;
                 }
-            } else if (token.name === 'set') {
-                sets.push(token);
-                return;
+                tokens.push(token);
             }
-            tokens.push(token);
         }, this);
+
+        // If extendsHasVar == true, then we know {% extends %} is not using a string literal, thus we can't
+        // compile until render is called, so we return false.
+        if (extendsHasVar) {
+            return false;
+        }
 
         if (tokens.length && tokens[0].name === 'extends') {
             this.blocks = _.extend({}, this.parent.blocks, this.blocks);
@@ -1667,7 +1712,7 @@ module.exports = function (indent, parentBlock, parser) {
         parser.compile.apply(this, [indent + '     ', parentBlock]);
 
     out = '(function () {\n' +
-        '    var loop = {}, __loopKey, __loopIndex = 0, __loopLength = 0,' +
+        '    var loop = {}, __loopKey, __loopIndex = 0, __loopLength = 0, __keys = [],' +
         '        __ctx_operand = _context["' + operand1 + '"],\n' +
         '        loop_cycle = function() {\n' +
         '            var args = _.toArray(arguments), i = loop.index0 % args.length;\n' +
